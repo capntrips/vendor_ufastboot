@@ -40,9 +40,7 @@
 #include <sparse/sparse.h>
 
 #include "constants.h"
-#include "transport.h"
-
-class Transport;
+#include "device/fastboot_device.h"
 
 namespace fastboot {
 
@@ -62,14 +60,12 @@ struct DriverCallbacks {
 };
 
 class FastBootDriver {
-    friend class FastBootTest;
-
   public:
     static constexpr int RESP_TIMEOUT = 30;  // 30 seconds
     static constexpr uint32_t MAX_DOWNLOAD_SIZE = std::numeric_limits<uint32_t>::max();
     static constexpr size_t TRANSPORT_CHUNK_SIZE = 1024;
 
-    FastBootDriver(Transport* transport, DriverCallbacks driver_callbacks = {},
+    FastBootDriver(DriverCallbacks driver_callbacks = {},
                    bool no_checks = false);
     ~FastBootDriver();
 
@@ -126,11 +122,6 @@ class FastBootDriver {
     void SetInfoCallback(std::function<void(const std::string&)> info);
     static const std::string RCString(RetCode rc);
     std::string Error();
-    RetCode WaitForDisconnect();
-
-    // Note: set_transport will return the previous transport.
-    Transport* set_transport(Transport* transport);
-    Transport* transport() const { return transport_; }
 
     RetCode RawCommand(const std::string& cmd, const std::string& message,
                        std::string* response = nullptr, std::vector<std::string>* info = nullptr,
@@ -147,8 +138,6 @@ class FastBootDriver {
 
     std::string ErrnoStr(const std::string& msg);
 
-    Transport* transport_;
-
   private:
     RetCode SendBuffer(android::base::borrowed_fd fd, size_t size);
     RetCode SendBuffer(const std::vector<char>& buf);
@@ -164,6 +153,7 @@ class FastBootDriver {
 
     int SparseWriteCallback(std::vector<char>& tpbuf, const char* data, size_t len);
 
+    FastbootDevice device;
     std::string error_;
     std::function<void(const std::string&)> prolog_;
     std::function<void(int)> epilog_;

@@ -31,8 +31,4 @@
 class FastBootTool {
   public:
     int Main(int argc, char* argv[]);
-
-    void ParseOsPatchLevel(boot_img_hdr_v1*, const char*);
-    void ParseOsVersion(boot_img_hdr_v1*, const char*);
-    unsigned ParseFsOption(const char*);
 };

@@ -50,7 +50,6 @@
 #include <storage_literals/storage_literals.h>
 
 #include "constants.h"
-#include "transport.h"
 
 using android::base::StringPrintf;
 using namespace android::storage_literals;
@@ -58,10 +57,9 @@ using namespace android::storage_literals;
 namespace fastboot {
 
 /*************************** PUBLIC *******************************/
-FastBootDriver::FastBootDriver(Transport* transport, DriverCallbacks driver_callbacks,
+FastBootDriver::FastBootDriver(DriverCallbacks driver_callbacks,
                                bool no_checks)
-    : transport_(transport),
-      prolog_(std::move(driver_callbacks.prolog)),
+    : prolog_(std::move(driver_callbacks.prolog)),
       epilog_(std::move(driver_callbacks.epilog)),
       info_(std::move(driver_callbacks.info)),
       disable_checks_(no_checks) {}
@@ -295,95 +293,6 @@ RetCode FastBootDriver::Download(sparse_file* s, bool use_crc, std::string* resp
     return HandleResponse(response, info);
 }
 
-RetCode FastBootDriver::Upload(const std::string& outfile, std::string* response,
-                               std::vector<std::string>* info) {
-    prolog_("Uploading '" + outfile + "'");
-    auto result = UploadInner(outfile, response, info);
-    epilog_(result);
-    return result;
-}
-
-// This function executes cmd, then expect a "DATA" response with a number N, followed
-// by N bytes, and another response.
-// This is the common way for the device to send data to the driver used by upload and fetch.
-RetCode FastBootDriver::RunAndReadBuffer(
-        const std::string& cmd, std::string* response, std::vector<std::string>* info,
-        const std::function<RetCode(const char* data, uint64_t size)>& write_fn) {
-    RetCode ret;
-    int dsize = 0;
-    if ((ret = RawCommand(cmd, response, info, &dsize))) {
-        error_ = android::base::StringPrintf("%s request failed: %s", cmd.c_str(), error_.c_str());
-        return ret;
-    }
-
-    if (dsize <= 0) {
-        error_ = android::base::StringPrintf("%s request failed, device reports %d bytes available",
-                                             cmd.c_str(), dsize);
-        return BAD_DEV_RESP;
-    }
-
-    const uint64_t total_size = dsize;
-    const uint64_t buf_size = std::min<uint64_t>(total_size, 1_MiB);
-    std::vector<char> data(buf_size);
-    uint64_t current_offset = 0;
-    while (current_offset < total_size) {
-        uint64_t remaining = total_size - current_offset;
-        uint64_t chunk_size = std::min(buf_size, remaining);
-        if ((ret = ReadBuffer(data.data(), chunk_size)) != SUCCESS) {
-            return ret;
-        }
-        if ((ret = write_fn(data.data(), chunk_size)) != SUCCESS) {
-            return ret;
-        }
-        current_offset += chunk_size;
-    }
-    return HandleResponse(response, info);
-}
-
-RetCode FastBootDriver::UploadInner(const std::string& outfile, std::string* response,
-                                    std::vector<std::string>* info) {
-    std::ofstream ofs;
-    ofs.open(outfile, std::ofstream::out | std::ofstream::binary);
-    if (ofs.fail()) {
-        error_ = android::base::StringPrintf("Failed to open '%s'", outfile.c_str());
-        return IO_ERROR;
-    }
-    auto write_fn = [&](const char* data, uint64_t size) {
-        ofs.write(data, size);
-        if (ofs.fail() || ofs.bad()) {
-            error_ = android::base::StringPrintf("Writing to '%s' failed", outfile.c_str());
-            return IO_ERROR;
-        }
-        return SUCCESS;
-    };
-    RetCode ret = RunAndReadBuffer(FB_CMD_UPLOAD, response, info, write_fn);
-    ofs.close();
-    return ret;
-}
-
-RetCode FastBootDriver::FetchToFd(const std::string& partition, android::base::borrowed_fd fd,
-                                  int64_t offset, int64_t size, std::string* response,
-                                  std::vector<std::string>* info) {
-    prolog_(android::base::StringPrintf("Fetching %s (offset=%" PRIx64 ", size=%" PRIx64 ")",
-                                        partition.c_str(), offset, size));
-    std::string cmd = FB_CMD_FETCH ":" + partition;
-    if (offset >= 0) {
-        cmd += android::base::StringPrintf(":0x%08" PRIx64, offset);
-        if (size >= 0) {
-            cmd += android::base::StringPrintf(":0x%08" PRIx64, size);
-        }
-    }
-    RetCode ret = RunAndReadBuffer(cmd, response, info, [&](const char* data, uint64_t size) {
-        if (!android::base::WriteFully(fd, data, size)) {
-            error_ = android::base::StringPrintf("Cannot write: %s", strerror(errno));
-            return IO_ERROR;
-        }
-        return SUCCESS;
-    });
-    epilog_(ret);
-    return ret;
-}
-
 // Helpers
 void FastBootDriver::SetInfoCallback(std::function<void(const std::string&)> info) {
     info_ = info;
@@ -418,10 +327,6 @@ std::string FastBootDriver::Error() {
     return error_;
 }
 
-RetCode FastBootDriver::WaitForDisconnect() {
-    return transport_->WaitForDisconnect() ? IO_ERROR : SUCCESS;
-}
-
 /****************************** PROTECTED *************************************/
 RetCode FastBootDriver::RawCommand(const std::string& cmd, const std::string& message,
                                    std::string* response, std::vector<std::string>* info,
@@ -440,10 +345,7 @@ RetCode FastBootDriver::RawCommand(const std::string& cmd, std::string* response
         return BAD_ARG;
     }
 
-    if (transport_->Write(cmd.c_str(), cmd.size()) != static_cast<int>(cmd.size())) {
-        error_ = ErrnoStr("Write to device failed");
-        return IO_ERROR;
-    }
+    device.ExecuteCommand((char *)cmd.c_str());
 
     // Read the response
     return HandleResponse(response, info, dsize);
@@ -461,61 +363,24 @@ RetCode FastBootDriver::DownloadCommand(uint32_t size, std::string* response,
 
 RetCode FastBootDriver::HandleResponse(std::string* response, std::vector<std::string>* info,
                                        int* dsize) {
-    char status[FB_RESPONSE_SZ + 1];
-    auto start = std::chrono::steady_clock::now();
-
-    auto set_response = [response](std::string s) {
-        if (response) *response = std::move(s);
-    };
-    auto add_info = [info](std::string s) {
-        if (info) info->push_back(std::move(s));
-    };
-
-    // erase response
-    set_response("");
-    while ((std::chrono::steady_clock::now() - start) < std::chrono::seconds(RESP_TIMEOUT)) {
-        int r = transport_->Read(status, FB_RESPONSE_SZ);
-        if (r < 0) {
-            error_ = ErrnoStr("Status read failed");
-            return IO_ERROR;
-        }
-
-        status[r] = '\0';  // Need the null terminator
-        std::string input(status);
-        if (android::base::StartsWith(input, "INFO")) {
-            std::string tmp = input.substr(strlen("INFO"));
-            info_(tmp);
-            add_info(std::move(tmp));
-            // We may receive one or more INFO packets during long operations,
-            // e.g. flash/erase if they are back by slow media like NAND/NOR
-            // flash. In that case, reset the timer since it's not a real
-            // timeout.
-            start = std::chrono::steady_clock::now();
-        } else if (android::base::StartsWith(input, "OKAY")) {
-            set_response(input.substr(strlen("OKAY")));
-            return SUCCESS;
-        } else if (android::base::StartsWith(input, "FAIL")) {
-            error_ = android::base::StringPrintf("remote: '%s'", status + strlen("FAIL"));
-            set_response(input.substr(strlen("FAIL")));
-            return DEVICE_FAIL;
-        } else if (android::base::StartsWith(input, "DATA")) {
-            std::string tmp = input.substr(strlen("DATA"));
-            uint32_t num = strtol(tmp.c_str(), 0, 16);
-            if (num > MAX_DOWNLOAD_SIZE) {
-                error_ = android::base::StringPrintf("Data size too large (%d)", num);
-                return BAD_DEV_RESP;
-            }
-            if (dsize) *dsize = num;
-            set_response(std::move(tmp));
-            return SUCCESS;
-        } else {
-            error_ = android::base::StringPrintf("Device sent unknown status code: %s", status);
+    if (response) *response = std::move(device.get_message());
+    if (info) *info = std::move(device.get_info());
+    // TODO: Monitor device.info_ and fire info_ callback?
+    if (device.get_result() == FastbootResult::OKAY) {
+        return SUCCESS;
+    } else if (device.get_result() == FastbootResult::FAIL) {
+        error_ = android::base::StringPrintf("remote: '%s'", device.get_message().c_str());
+        return DEVICE_FAIL;
+    } else if (device.get_result() == FastbootResult::DATA) {
+        uint32_t num = strtol(device.get_message().c_str(), 0, 16);
+        if (num > MAX_DOWNLOAD_SIZE) {
+            error_ = android::base::StringPrintf("Data size too large (%d)", num);
             return BAD_DEV_RESP;
         }
-
-    }  // End of while loop
-
-    return TIMEOUT;
+        if (dsize) *dsize = num;
+        return SUCCESS;
+    }
+    return BAD_DEV_RESP;
 }
 
 std::string FastBootDriver::ErrnoStr(const std::string& msg) {
@@ -560,7 +425,7 @@ RetCode FastBootDriver::SendBuffer(const void* buf, size_t size) {
         return BAD_ARG;
     }
     // Write the buffer
-    ssize_t tmp = transport_->Write(buf, size);
+    ssize_t tmp = device.StreamDownload(buf, size);
 
     if (tmp < 0) {
         error_ = ErrnoStr("Write to device failed in SendBuffer()");
@@ -568,21 +433,6 @@ RetCode FastBootDriver::SendBuffer(const void* buf, size_t size) {
     } else if (static_cast<size_t>(tmp) != size) {
         error_ = android::base::StringPrintf("Failed to write all %zu bytes", size);
 
-        return IO_ERROR;
-    }
-
-    return SUCCESS;
-}
-
-RetCode FastBootDriver::ReadBuffer(void* buf, size_t size) {
-    // Read the buffer
-    ssize_t tmp = transport_->Read(buf, size);
-
-    if (tmp < 0) {
-        error_ = ErrnoStr("Read from device failed in ReadBuffer()");
-        return IO_ERROR;
-    } else if (static_cast<size_t>(tmp) != size) {
-        error_ = android::base::StringPrintf("Failed to read all %zu bytes", size);
         return IO_ERROR;
     }
 
@@ -620,11 +470,6 @@ int FastBootDriver::SparseWriteCallback(std::vector<char>& tpbuf, const char* da
     }
 
     return 0;
-}
-
-Transport* FastBootDriver::set_transport(Transport* transport) {
-    std::swap(transport_, transport);
-    return transport;
 }
 
 }  // End namespace fastboot

@@ -28,7 +28,6 @@
 #include <android/hardware/health/2.0/IHealth.h>
 
 #include "commands.h"
-#include "transport.h"
 #include "variables.h"
 
 class FastbootDevice {
@@ -37,10 +36,8 @@ class FastbootDevice {
     ~FastbootDevice();
 
     void CloseDevice();
-    void ExecuteCommands();
+    void ExecuteCommand(char* command);
     bool WriteStatus(FastbootResult result, const std::string& message);
-    bool HandleData(bool read, std::vector<char>* data);
-    bool HandleData(bool read, char* data, uint64_t size);
     std::string GetCurrentSlot();
 
     // Shortcuts for writing status results.
@@ -48,8 +45,13 @@ class FastbootDevice {
     bool WriteFail(const std::string& message);
     bool WriteInfo(const std::string& message);
 
+    ssize_t StreamDownload(const void* buf, size_t size);
+
+    FastbootResult get_result() { return result_; }
+    std::string get_message() { return message_; }
+    std::vector<std::string> get_info() { return info_; }
+
     std::vector<char>& download_data() { return download_data_; }
-    Transport* get_transport() { return transport_.get(); }
     android::sp<android::hardware::boot::V1_0::IBootControl> boot_control_hal() {
         return boot_control_hal_;
     }
@@ -64,11 +66,15 @@ class FastbootDevice {
   private:
     const std::unordered_map<std::string, CommandHandler> kCommandMap;
 
-    std::unique_ptr<Transport> transport_;
+    FastbootResult result_;
+    std::string message_;
+    std::vector<std::string> info_;
+
     android::sp<android::hardware::boot::V1_0::IBootControl> boot_control_hal_;
     android::sp<android::hardware::boot::V1_1::IBootControl> boot1_1_;
     android::sp<android::hardware::health::V2_0::IHealth> health_hal_;
     android::sp<android::hardware::fastboot::V1_1::IFastboot> fastboot_hal_;
     std::vector<char> download_data_;
+    uint64_t download_offset_;
     std::string active_slot_;
 };
